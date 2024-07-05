@@ -165,6 +165,7 @@ type SendRequestExtra struct {
 // field in incoming message events to figure out what it contains is also a good way to learn how to
 // send the same kind of message.
 func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waProto.Message, extra ...SendRequestExtra) (resp SendResponse, err error) {
+	*message.Conversation = strings.ReplaceAll(*message.Conversation, "<br>", "\n")
 	var req SendRequestExtra
 	if len(extra) > 1 {
 		err = errors.New("only one extra parameter may be provided to SendMessage")
