@@ -164,6 +164,120 @@ func main() {
 	}
 }
 
+
+func mainan() {
+	waBinary.IndentXML = true
+	flag.Parse()
+
+	if *debugLogs {
+		logLevel = "DEBUG"
+	}
+	if *requestFullSync {
+		store.DeviceProps.RequireFullSync = proto.Bool(true)
+		store.DeviceProps.HistorySyncConfig = &waCompanionReg.DeviceProps_HistorySyncConfig{
+			FullSyncDaysLimit:   proto.Uint32(3650),
+			FullSyncSizeMbLimit: proto.Uint32(102400),
+			StorageQuotaMb:      proto.Uint32(102400),
+		}
+	}
+	log = waLog.Stdout("Main", logLevel, true)
+
+	dbLog := waLog.Stdout("Database", logLevel, true)
+	storeContainer, err := sqlstore.New(*dbDialect, *dbAddress, dbLog)
+	if err != nil {
+		log.Errorf("Failed to connect to database: %v", err)
+		return
+	}
+	device, err := storeContainer.GetFirstDevice()
+	if err != nil {
+		log.Errorf("Failed to get device: %v", err)
+		return
+	}
+
+	cli = whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
+	var isWaitingForPair atomic.Bool
+	cli.PrePairCallback = func(jid types.JID, platform, businessName string) bool {
+		isWaitingForPair.Store(true)
+		defer isWaitingForPair.Store(false)
+		log.Infof("Pairing %s (platform: %q, business name: %q). Type r within 3 seconds to reject pair", jid, platform, businessName)
+		select {
+		case reject := <-pairRejectChan:
+			if reject {
+				log.Infof("Rejecting pair")
+				return false
+			}
+		case <-time.After(3 * time.Second):
+		}
+		log.Infof("Accepting pair")
+		return true
+	}
+
+	ch, err := cli.GetQRChannel(context.Background())
+	if err != nil {
+		// This error means that we're already logged in, so ignore it.
+		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+			log.Errorf("Failed to get QR channel: %v", err)
+		}
+	} else {
+		go func() {
+			for evt := range ch {
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else {
+					log.Infof("QR channel result: %s", evt.Event)
+				}
+			}
+		}()
+	}
+
+	cli.AddEventHandler(handler)
+	err = cli.Connect()
+	if err != nil {
+		log.Errorf("Failed to connect: %v", err)
+		return
+	}
+
+	c := make(chan os.Signal, 1)
+	input := make(chan string)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		defer close(input)
+		scan := bufio.NewScanner(os.Stdin)
+		for scan.Scan() {
+			line := strings.TrimSpace(scan.Text())
+			if len(line) > 0 {
+				input <- line
+			}
+		}
+	}()
+	for {
+		select {
+		case <-c:
+			log.Infof("Interrupt received, exiting")
+			cli.Disconnect()
+			return
+		case cmd := <-input:
+			if len(cmd) == 0 {
+				log.Infof("Stdin closed, exiting")
+				cli.Disconnect()
+				return
+			}
+			if isWaitingForPair.Load() {
+				if cmd == "r" {
+					pairRejectChan <- true
+				} else if cmd == "a" {
+					pairRejectChan <- false
+				}
+				continue
+			}
+			args := strings.Fields(cmd)
+			cmd = args[0]
+			args = args[1:]
+			go handleCmd(strings.ToLower(cmd), args)
+		}
+	}
+}
+
 func parseJID(arg string) (types.JID, bool) {
 	if arg[0] == '+' {
 		arg = arg[1:]
